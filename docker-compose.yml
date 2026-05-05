@@ -7,6 +7,7 @@ services:
         #   - bambu:   Bambu Connect - for Bambu Lab 3D printers such as the Bambu Lab A1, P1, and X1 series.
         #   - elegoo:  Elegoo Connect - for Elegoo OS 3D printers such as the Elegoo Centauri & Elegoo Centauri Carbon.
         #   - klipper: Use this for Klipper / Moonraker based printers.
+        #   - elegoo_cc2: Use this for Elegoo Centauri Carbon 2 printers.
         #
         # Set this to the mode you want to use, and then uncomment the required settings for the mode bellow.
         - COMPANION_MODE=bambu
@@ -30,6 +31,17 @@ services:
         #  Find using the printer's display or use https://octoeverywhere.com/s/elegoo-ip
         #- PRINTER_IP=XXX.XXX.XXX.XXX
 
+        #
+        # Required for Elegoo Centauri Carbon 2 Connect
+        #
+        #  LAN Mode must be enabled. Matrix/Elegoo Cloud is not supported.
+        #
+        #  Find using the printer's display or use https://octoeverywhere.com/s/elegoo-ip
+        #- PRINTER_IP=XXX.XXX.XXX.XXX
+        #- SERIAL_NUMBER=XXXXXXXX
+        #
+        #  Optional - The access code for Elegoo Centauri Carbon 2 connect.
+        #- ACCESS_CODE=XXXXXX
 
         #
         # Required For Klipper / Moonraker

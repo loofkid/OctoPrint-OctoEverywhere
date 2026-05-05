@@ -9,3 +9,6 @@ dist
 *.zip
 py2venv/*
 py3venv/*
+*.vscode*
+*.venv*
+.vscode/settings.json
