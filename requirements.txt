@@ -7,7 +7,7 @@
 #
 # For comments on package lock versions, see the comments in the pyproject.toml file.
 #
-octowebsocket_client==1.9.0
+octowebsocket_client==1.9.1
 requests>=2.31.0
 octoflatbuffers==24.3.27
 pillow
@@ -17,6 +17,7 @@ dnspython>=2.3.0
 httpx>=0.24.1
 urllib3>=2.0.0
 sentry-sdk>=2.20.0,<3
+pybind11
 #zstandard>=0.22.0,<0.23.0
 
 # Required only for linux host based plugins, used by the installer and the plugin for setup.
@@ -25,5 +26,5 @@ qrcode<=8.0.0
 # The following are required only for Moonraker
 configparser
 
-# Only used for Bambu Connect
+# Only used for Bambu Connect and Elegoo CC2 Connect
 paho-mqtt>=2.0.0

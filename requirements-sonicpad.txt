@@ -3,7 +3,7 @@
 # This file should be IDENTICAL to the requirements.txt file, except for the comments:
 #  - urllib3 must be under 2.0, because it needs openssl 1.1.1, which the sonic pad doesn't have.
 #
-octowebsocket_client==1.9.0
+octowebsocket_client==1.9.1
 requests>=2.31.0
 octoflatbuffers==24.3.27
 pillow
@@ -13,6 +13,7 @@ dnspython>=2.3.0
 httpx>=0.24.1
 urllib3>=1.26.15,<2.0.0
 sentry-sdk>=2.20.0,<3
+pybind11
 #zstandard>=0.22.0,<0.23.0
 
 # Required only for linux host based plugins, used by the installer and the plugin for setup.

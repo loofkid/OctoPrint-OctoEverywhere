@@ -24,6 +24,7 @@ from ..Proto import OeAuthAllowed
 from ..Proto.PathTypes import PathTypes
 from ..interfaces import IWebStream
 from ..buffer import Buffer, BufferOrNone
+from ..streamreadhelper import StreamReadHelper
 from ..httpstreamaccumulationreader import HttpStreamAccumulationReader
 from ..httpresult import HttpResult, HttpResultOrNone
 
@@ -68,6 +69,7 @@ class OctoWebStreamHttpHelper:
 
         # Vars for response reading
         self.BodyReadTempBuffer:Optional[Buffer] = None
+        self.BodyReadUseReadInto = True
         self.ChunkedBodyHasNoContentLengthHeaders = False
         self.CompressionType:Optional[int] = None
         self.CompressionTimeSec = -1
@@ -876,6 +878,7 @@ class OctoWebStreamHttpHelper:
         # BUT not all buffers are owned by us, for example quick cam buffers, so we can't release everything.
         finalDataBufferNeedsReleased = False
         finalDataBuffer:BufferOrNone = None
+        finalDataBufferCreationSize:Optional[int] = None
         try:
             bodyReadStartSec = time.time()
             if self.IsUsingFullBodyBuffer:
@@ -894,19 +897,8 @@ class OctoWebStreamHttpHelper:
                 # and failed to find any content length headers. In that case, we will just read fixed sized chunks.
                 if self.ChunkedBodyHasNoContentLengthHeaders is False and boundaryStr is not None and len(boundaryStr) != 0:
                     # Try to read a single boundary chunk
-                    readLength = self.readStreamChunk(httpResult, boundaryStr)
-                    # If we get a length, we have a buffer to use.
-                    if readLength != 0:
-                        if self.BodyReadTempBuffer is None:
-                            raise Exception("The body read temp buffer is None, but we are trying to read the body.")
-                        # We create a memory view from the buffer, which is a zero copy operation and zero copy slicing.
-                        # This allows us to pass the buffer around without copying it, but we do have to be sure to release the memory views when we are done.
-                        # This first memoryview is created and destroyed here using the with block.
-                        with memoryview(self.BodyReadTempBuffer.Get()) as mv:
-                            # NOTE this slice ALSO CREATES A MEMORY VIEW, which is then owned by the buffer, so it needs to be released.
-                            mvSlice = mv[0:readLength]
-                            finalDataBuffer = Buffer(mvSlice)
-                            finalDataBufferNeedsReleased = True
+                    # This reads into the temp body buffer, so we need to set finalDataBufferCreationSize to slice it.
+                    finalDataBufferCreationSize = self.readStreamChunk(httpResult, boundaryStr)
                 else:
                     if self.HttpStreamAccumulationReader is not None or (responseHandlerContext is None and self.shouldDoUnknownBodyChunkRead(contentTypeLower, contentLength)):
                         # According to the HTTP 1.1 spec, if there's no content length and no boundary string, then the body is chunk based transfer encoding.
@@ -932,7 +924,25 @@ class OctoWebStreamHttpHelper:
                             else:
                                 # Use a 2mb buffer.
                                 defaultBodyReadSizeBytes = 1024 * 1024 * 2
-                        finalDataBuffer = self.doBodyRead(httpResult, defaultBodyReadSizeBytes)
+
+                        # Use the temp body buffer to read into, this is reused across reads to avoid multiple allocations.
+                        # This reads into the temp body buffer, so we need to set finalDataBufferCreationSize to slice it.
+                        tempBodyBuffer = self._EnsureBodyReadTempBufferSize(defaultBodyReadSizeBytes).ForceAsByteArray()
+                        finalDataBufferCreationSize = self.doBodyReadInto(httpResult, tempBodyBuffer, 0, defaultBodyReadSizeBytes)
+
+            # If this is set, we read data into the temp buffer and we need to create the final data buffer from it.
+            if finalDataBufferCreationSize is not None and finalDataBufferCreationSize > 0:
+                # The temp buffer must have a valid value if we are here.
+                if self.BodyReadTempBuffer is None:
+                    raise Exception("The body read temp buffer is None, but we are trying to read the body.")
+                # We create a memory view from the buffer, which is a zero copy operation and zero copy slicing.
+                # This allows us to pass the buffer around without copying it, but we do have to be sure to release the memory views when we are done.
+                # This first memoryview is created and destroyed here using the with block.
+                with memoryview(self.BodyReadTempBuffer.Get()) as mv:
+                    # NOTE this slice ALSO CREATES A MEMORY VIEW, which is then owned by the buffer, so it needs to be released.
+                    mvSlice = mv[0:finalDataBufferCreationSize]
+                    finalDataBuffer = Buffer(mvSlice)
+                    finalDataBufferNeedsReleased = True
 
             # Keep track of read times.
             thisBodyReadTimeSec = time.time() - bodyReadStartSec
@@ -1020,8 +1030,7 @@ class OctoWebStreamHttpHelper:
         foundContentLength = False
 
         # If the temp array isn't setup, do it now.
-        if self.BodyReadTempBuffer is None:
-            self.BodyReadTempBuffer = Buffer(bytearray(10*1024))
+        tempBufferByteArray = self._EnsureBodyReadTempBufferSize(10*1024).ForceAsByteArray()
 
         # Note. OctoPrint webcam streams have content-length headers in each chunk. However, the standard
         # says it's not required. So if we can find them use them, but if not we will set the
@@ -1032,6 +1041,12 @@ class OctoWebStreamHttpHelper:
         # If we can't find it after our max size, we declare it's not there (which is fine)
         # and will use a different read method going forward.
         c_maxHeaderSearchSizeBytes = 5 * 1024
+        endOfAllHeadersMatch = b"\r\n\r\n"
+        endOfHeaderMatch = b"\r\n"
+        contentLengthHeaderName = b"content-length"
+        boundaryBytes = boundaryStr.encode("utf-8")
+        boundaryWithPrefixBytes = b"--" + boundaryBytes
+        boundaryWithLeadingNewlineBytes = b"\r\n--" + boundaryBytes
         tempBufferFilledSize = 0
         try:
             # Loop until found or we have hit the search limit.
@@ -1041,40 +1056,32 @@ class OctoWebStreamHttpHelper:
                 # we accidentally read two boundary messages at once.
                 # Most boundary headers fit well under 512 bytes, so reading this much
                 # almost always gets all headers in a single syscall.
-                headerBuffer = self.doBodyRead(httpResult, 512)
+                readChunkSize = 512
+                tempBufferByteArray = self._EnsureBodyReadTempBufferSize(tempBufferFilledSize + readChunkSize).ForceAsByteArray()
+                headerBufferReadSize = self.doBodyReadInto(httpResult, tempBufferByteArray, tempBufferFilledSize, readChunkSize)
 
                 # If this returns 0, the body read is complete
-                if headerBuffer is None:
+                if headerBufferReadSize == 0:
                     # We should return the length of the buffer we have read so far.
                     return tempBufferFilledSize
 
-                # Add the header buffer to the temp output
-                ba = self.BodyReadTempBuffer.ForceAsByteArray()
-                ba[tempBufferFilledSize:tempBufferFilledSize+len(headerBuffer)] = headerBuffer
-                tempBufferFilledSize += len(headerBuffer)
-
-                # Convert the entire buffer read so far into a string for parsing.
-                # We must use the decode function here, not just str(), because in py3 str() will make a "ToString" the object,
-                # and not actually return us the contents of the buffer as a string.
-                headerStr = ba[:tempBufferFilledSize].decode(errors="ignore")
+                tempBufferFilledSize += headerBufferReadSize
 
                 # Validate the headers starts with what we expect.
                 # According the the RFC, the boundary should start with the boundary string or '--' + boundary string.
                 # However, we have also seen \r\n--<str> and also no boundary string for the first frame as well. So this might fire once or twice, and that's fine.
                 # These are in order of how common they are, for perf.
-                if headerStr.startswith("--"+boundaryStr) is False and headerStr.startswith(boundaryStr) is False and headerStr.startswith("\r\n--"+boundaryStr) is False:
+                if (
+                    tempBufferByteArray.startswith(boundaryWithPrefixBytes, 0, tempBufferFilledSize) is False
+                    and tempBufferByteArray.startswith(boundaryBytes, 0, tempBufferFilledSize) is False
+                    and tempBufferByteArray.startswith(boundaryWithLeadingNewlineBytes, 0, tempBufferFilledSize) is False
+                ):
                     # Always report the first time we find this, otherwise, report only occasionally.
                     if self.MissingBoundaryWarningCounter % 120 == 0:
                         # Trim the string to print it.
-                        outputStr = headerStr
-                        if len(outputStr) > 40:
-                            outputStr = outputStr[:40]
+                        outputStr = tempBufferByteArray[:min(tempBufferFilledSize, 40)].decode(errors="ignore")
                         self.Logger.warning("We read a web stream body frame, but it didn't start with the expected boundary header. expected:'"+boundaryStr+"' got:^^"+outputStr+"^^")
                     self.MissingBoundaryWarningCounter += 1
-
-                # Find out how long the headers are. The \r\n\r\n sequence ends the headers.
-                endOfAllHeadersMatch = "\r\n\r\n"
-                endOfHeaderMatch = "\r\n"
 
                 # Try to find headers
                 # This logic checks for errors, and if found, don't stop the logic because of them
@@ -1082,21 +1089,27 @@ class OctoWebStreamHttpHelper:
                 # chunks, we could read a chunk that splits the content-length header in half, which would cause errors.
                 # So we just allow the system to keep reading until we hit the limit, because the next read would then have the full
                 # header we are looking for.
-                headerSize = headerStr.find(endOfAllHeadersMatch)
+                headerSize = tempBufferByteArray.find(endOfAllHeadersMatch, 0, tempBufferFilledSize)
                 if headerSize != -1:
                     # We found at least some headers!
 
                     # Add 4 bytes for the \r\n\r\n end of header sequence. Also add two bytes for the \r\n at the end of this boundary chunk.
-                    headerSize += 4 + 2
+                    headerEnd = headerSize
+                    headerSize += len(endOfAllHeadersMatch) + 2
 
                     # Split out the headers
-                    headers = headerStr.split(endOfHeaderMatch)
+                    headers = tempBufferByteArray[:headerEnd].split(endOfHeaderMatch)
                     for header in headers:
-                        if header.lower().startswith("content-length"):
+                        name, _, value = header.partition(b":")
+                        if name.strip().lower() == contentLengthHeaderName:
                             # We found the content-length header!
-                            p = header.split(':')
-                            if len(p) == 2:
-                                frameSize = int(p[1].strip())
+                            value = value.strip()
+                            if len(value) > 0:
+                                boundaryStart = value.find(b"--")
+                                if boundaryStart != -1:
+                                    value = value[:boundaryStart].strip()
+                            if len(value) > 0:
+                                frameSize = int(value)
                                 foundContentLength = True
                             break
 
@@ -1126,20 +1139,18 @@ class OctoWebStreamHttpHelper:
 
         # Read the remainder of the chunk.
         if toRead > 0:
-            data = self.doBodyRead(httpResult, toRead)
+            tempBufferByteArray = self._EnsureBodyReadTempBufferSize(tempBufferFilledSize + toRead).ForceAsByteArray()
+            dataReadSize = self.doBodyReadInto(httpResult, tempBufferByteArray, tempBufferFilledSize, toRead)
 
             # If we hit the end of the body, return how much we read already.
-            if data is None:
+            if dataReadSize == 0:
                 return tempBufferFilledSize
 
             # Warn if twe didn't read it all
-            if len(data) != toRead:
+            if dataReadSize != toRead:
                 self.Logger.warning(self.getLogMsgPrefix()+" while reading a boundary chunk, doBodyRead didn't return the full size we requested.")
 
-            # Copy this data into the temp buffer
-            ba = self.BodyReadTempBuffer.ForceAsByteArray()
-            ba[tempBufferFilledSize:tempBufferFilledSize+len(data)] = data.Get()
-            tempBufferFilledSize += len(data)
+            tempBufferFilledSize += dataReadSize
 
         # Update our read rate. This is a metric we send along in the stream if the it's a multipart stream, to know how fast we are reading it.
         # Basically for webcams streamed via http, it's the frame rate.
@@ -1168,61 +1179,59 @@ class OctoWebStreamHttpHelper:
         return tempBufferFilledSize
 
 
-    def doBodyRead(self, httpResult:HttpResult, readSize:int) -> BufferOrNone:
+    # Ensures the temp body buffer is sized correctly and returns it.
+    def _EnsureBodyReadTempBufferSize(self, requiredSize:int) -> Buffer:
+        if self.BodyReadTempBuffer is None:
+            # If there is no buffer, make it now either using the required size or a default size, whichever is larger.
+            self.BodyReadTempBuffer = Buffer(bytearray(max(10*1024, requiredSize)))
+            return self.BodyReadTempBuffer
+        tempBufferByteArray = self.BodyReadTempBuffer.ForceAsByteArray()
+        currentSize = len(tempBufferByteArray)
+        if currentSize < requiredSize:
+            tempBufferByteArray.extend(bytearray(requiredSize - currentSize))
+        return self.BodyReadTempBuffer
+
+
+    # The most effective way to read the body is to use the readinto function, which reads directly into a pre-allocated buffer, avoiding extra allocations and copies.
+    def doBodyReadInto(self, httpResult:HttpResult, targetBuffer:bytearray, offset:int, readSize:int) -> int:
         try:
             # Ensure there's an actual requests lib Response object to read from
             response = httpResult.ResponseForBodyRead
             if response is None:
-                raise Exception("doBodyRead was called with a result that has not Response object to read from.")
+                raise Exception("doBodyReadInto was called with a result that has not Response object to read from.")
 
-            # In the past we used the iter_content and such streaming function calls, but the calls had a few issues.
-            #  1) They use a generator system where they yield data buffers. The generator has to remain referenced or the connection closes.
-            #  2) Since the generator could only be created once, the chunk size was set on the first creation and couldn't be used.
-            #
-            # Thus in our case, we want to just read the response raw. This is what the chunk logic does under the hood anyways, so this path
-            # is more direct and should be more efficient.
-            #
-            # Note, whatever size we pass in will be allocated as a buffer, filled, and then sliced.
-            # So if we pass in a huge value, we will get a big buffer allocated.
-            # So if we know the size, we should use it, so that the buffer allocated it the same amount that's returned.
-            # Also note, any improvements made here should be updated in ReadAllContentFromStreamResponse as well!
-            data = response.raw.read(readSize)
+            bytesRead, self.BodyReadUseReadInto = StreamReadHelper.ReadIntoByteArray(response.raw, targetBuffer, offset, readSize, self.BodyReadUseReadInto)
+            if bytesRead > 0:
+                return bytesRead
 
-            # If we got a data buffer return it.
-            if data is not None and len(data) > 0:
-                return Buffer(data)
-
-            # Data will return b"" (aka empty buffer) when...
-            #   1) The stream is closed and all of the data is consumed
-            #   2) OR there was an error and there's a body but it can't be streamed.
-            # Thus, when data returns empty, we need to check if there's content. If content != null we need to send it back.
+            # Preserve the response.content fallback used by doBodyRead for non-streamed bodies.
             content = response.content
             if len(content) > 0:
                 if len(content) > readSize:
                     self.Logger.warning("Http request has non-streamed content but it's larger than the requested readSize. Returning anyways.")
-                return Buffer(content)
-
-            # Otherwise we are done, return None to end the octostream.
-            return None
+                bytesRead = min(len(content), readSize)
+                targetBuffer[offset:offset + bytesRead] = content[0:bytesRead]
+                return bytesRead
+            return 0
 
         except requests.exceptions.ChunkedEncodingError as _:
             # This shouldn't happen now that we don't use the iter_content read, but it doesn't hurt.
-            return None
+            return 0
         except requests.exceptions.StreamConsumedError as _:
             # When this exception is thrown, it means the entire body has been read.
-            return None
+            return 0
         except urllib3.exceptions.ReadTimeoutError as _:
             # Fired then the read times out, this should just close the stream.
             # TODO - this will leave this stream with an incomplete body size, we should indicate that to the server.
-            return None
+            return 0
         except Exception as e:
             # There doesn't seem to be an exception type for this one, so we will just catch it like this.
             if "IncompleteRead" in str(e):
                 # Don't do the entire sentry exception print, since it's too long.
                 self.Logger.warning("doBodyRead failed with an IncompleteRead, so the stream is done.")
-                return None
-            Sentry.OnException(self.getLogMsgPrefix()+ " exception thrown in doBodyRead. Ending body read.", e)
-            return None
+                return 0
+            Sentry.OnException(self.getLogMsgPrefix()+ " exception thrown in doBodyReadInto. Ending body read.", e)
+            return 0
 
 
     # Based on the content length and the content type, determine if we should do a doUnknownBodySizeRead read.
